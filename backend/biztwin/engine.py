@@ -21,6 +21,7 @@ from .market import MarketConditions
 from .parameters import ParameterSet
 from .pricing import PricingStrategy
 from .randomness import RandomnessProvider
+from .segment import SegmentMix
 
 
 @dataclass
@@ -87,6 +88,7 @@ class SimulationEngine(ABC):
         enable_backlog: bool = True,
         enable_referral: bool = True,
         market: MarketConditions | None = None,
+        segment_mix: SegmentMix | None = None,
     ):
         self.params = params
         self.pricing = pricing
@@ -105,6 +107,32 @@ class SimulationEngine(ABC):
             demand_index=params.demand_index.value,
             seasonality_index=params.seasonality_index.value,
         )
+        # Customer Segment, now reachable from the AGGREGATE engine too
+        # (Architecture Review follow-up: the causal graph's Segment ->
+        # Funnel edge previously existed only in the individual-level
+        # SyntheticDataGenerator, never here - so a reviewer asking "does
+        # Segment affect the numbers this dashboard actually simulates
+        # forward with" had no honest yes). segment_mix is opt-in and None
+        # by default: with no mix supplied, both blended multipliers below
+        # are exactly 1.0, so an engine built without one reproduces every
+        # previously-verified number exactly bit-for-bit - identical to the
+        # pre-existing behavior, nothing already verified can regress.
+        # When a mix IS supplied, `_compute_step` applies one
+        # population-weighted (by catalog_weight) blended conversion and
+        # churn multiplier to the whole population each step. This is an
+        # honest approximation of the mix's net effect on the aggregate
+        # numbers, not a replacement for true per-segment cohort tracking
+        # (splitting the single Active population into per-segment
+        # sub-populations remains a real Prototype 2 extension - see
+        # SegmentMix.blended_multipliers's own docstring).
+        self.segment_mix = segment_mix
+        if segment_mix is not None:
+            blended = segment_mix.blended_multipliers()
+            self._segment_conversion_multiplier = blended["conversion"]
+            self._segment_churn_multiplier = blended["churn"]
+        else:
+            self._segment_conversion_multiplier = 1.0
+            self._segment_churn_multiplier = 1.0
 
     def _compute_step(self, prev: StepResult, is_first_step: bool = False) -> StepResult:
         p = self.params.snapshot_values()
@@ -142,8 +170,9 @@ class SimulationEngine(ABC):
         overflow = max(0.0, qo_raw - capacity)
         slack = max(0.0, capacity - qo_raw)
 
-        # 4. Conversion at the (price-adjusted) rate:
+        # 4. Conversion at the (price-adjusted, segment-mix-adjusted) rate:
         effective_r2 = self.pricing.compute_effective_conversion_rate(p["r2_qo_to_active_base"], price)
+        effective_r2 = min(effective_r2 * self._segment_conversion_multiplier, 1.0)
         new_active_from_qo = self.provider.draw_binomial_count(qualified_opportunity, effective_r2)
 
         # 5. Backlog (Loop B, Final Design Sec. 6) - overflow queues instead
@@ -165,7 +194,8 @@ class SimulationEngine(ABC):
         if is_first_step:
             churned = 0.0
         else:
-            churned = self.provider.draw_binomial_count(prev.active, p["monthly_churn_hazard"])
+            churn_hazard = min(p["monthly_churn_hazard"] * self._segment_churn_multiplier, 1.0)
+            churned = self.provider.draw_binomial_count(prev.active, churn_hazard)
         active = prev.active - churned + new_active_from_qo + new_active_from_backlog
 
         return StepResult(

@@ -64,6 +64,24 @@ class SegmentMix:
         idx = rng.choice(len(self.segments), p=probabilities)
         return self.segments[idx]
 
+    def blended_multipliers(self) -> dict[str, float]:
+        """
+        Population-weighted (by catalog_weight) blend of this mix's
+        conversion and churn multipliers into two single numbers - what the
+        aggregate, single-population SimulationEngine can actually consume
+        (it has one Active stock, not per-segment cohorts). An honest
+        approximation: it makes the mix's net effect visible in the
+        aggregate numbers, but it cannot reproduce a shift in mix
+        composition over time the way true per-segment cohort tracking
+        would (that remains a Prototype 2 extension - see engine.py).
+        """
+        total_weight = sum(s.catalog_weight for s in self.segments)
+        if total_weight <= 0:
+            return {"conversion": 1.0, "churn": 1.0}
+        conversion = sum(s.catalog_weight * s.conversion_multiplier for s in self.segments) / total_weight
+        churn = sum(s.catalog_weight * s.churn_multiplier for s in self.segments) / total_weight
+        return {"conversion": conversion, "churn": churn}
+
     def churn_weights(self, names: list[str]) -> list[float]:
         """Relative likelihood each of these customers (given as a list of
         segment names, one per candidate) is selected as part of this
